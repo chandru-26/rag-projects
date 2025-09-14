@@ -1,24 +1,20 @@
-# backend/main.py
 import os
 import uuid
 import shutil
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from fastapi import FastAPI, UploadFile, File, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import google.generativeai as genai  # ✅ Gemini SDK
+from typing import List
+import psycopg2
+import google.generativeai as genai
 
 from embeddings import create_or_get_collection, embed_texts
-from file_utils import (
-    extract_text_from_pdf,
-    extract_text_from_docx,
-    extract_text_from_txt,
-    chunk_text,
-)
+from file_utils import extract_text_from_pdf, extract_text_from_docx, extract_text_from_txt, chunk_text
 
 # ==========================
 # FastAPI setup
 # ==========================
-app = FastAPI(title="DocQA Backend")
+app = FastAPI(title="DocQA Backend with Auth")
 
 app.add_middleware(
     CORSMiddleware,
@@ -30,31 +26,114 @@ app.add_middleware(
 
 UPLOAD_DIR = os.getenv("UPLOAD_DIR", "uploads")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
-
 COLLECTION_NAME = "documents"
 
 # ==========================
-# Configure Gemini
+# Gemini LLM setup
 # ==========================
-GEMINI_API_KEY = os.getenv(
-    "GEMINI_API_KEY",
-    "AIzaSyCMNOHwnU1uiWzaXz1y8dDNRE_y5CcsGLs"  # ⚠️ replace with your real key
-)
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "AIzaSyCMNOHwnU1uiWzaXz1y8dDNRE_y5CcsGLs")
 genai.configure(api_key=GEMINI_API_KEY)
 gemini_model = genai.GenerativeModel("gemini-1.5-flash")
 
 # ==========================
-# File upload endpoint
+# PostgreSQL setup
+# ==========================
+DB_HOST = "localhost"
+DB_PORT = 5432
+DB_USER = "postgres"
+DB_PASS = "root"
+DB_NAME = "docqa"
+
+# Connect or create DB
+try:
+    conn = psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASS, host=DB_HOST, port=DB_PORT)
+except psycopg2.OperationalError:
+    from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
+    tmp_conn = psycopg2.connect(dbname="postgres", user=DB_USER, password=DB_PASS, host=DB_HOST, port=DB_PORT)
+    tmp_conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+    tmp_cur = tmp_conn.cursor()
+    tmp_cur.execute(f"CREATE DATABASE {DB_NAME}")
+    tmp_cur.close()
+    tmp_conn.close()
+    conn = psycopg2.connect(dbname=DB_NAME, user=DB_USER, password=DB_PASS, host=DB_HOST, port=DB_PORT)
+
+cur = conn.cursor()
+
+# Create tables if not exist
+cur.execute("""
+CREATE TABLE IF NOT EXISTS users (
+    id SERIAL PRIMARY KEY,
+    username TEXT UNIQUE NOT NULL,
+    password TEXT NOT NULL
+)
+""")
+cur.execute("""
+CREATE TABLE IF NOT EXISTS chats (
+    id SERIAL PRIMARY KEY,
+    user_id INT REFERENCES users(id),
+    query TEXT,
+    response TEXT,
+    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)
+""")
+conn.commit()
+
+# ==========================
+# Auth dependency
+# ==========================
+def get_user(username: str):
+    cur.execute("SELECT id, username FROM users WHERE username=%s", (username,))
+    return cur.fetchone()
+
+# ==========================
+# Models
+# ==========================
+class UserIn(BaseModel):
+    username: str
+    password: str
+
+class QueryIn(BaseModel):
+    query: str
+    top_k: int = 4
+    username: str
+
+# ==========================
+# Auth routes
+# ==========================
+@app.post("/register")
+def register(user: UserIn):
+    try:
+        cur.execute("INSERT INTO users (username, password) VALUES (%s,%s) RETURNING id", (user.username, user.password))
+        user_id = cur.fetchone()[0]
+        conn.commit()
+        return {"status": "ok", "user_id": user_id}
+    except psycopg2.errors.UniqueViolation:
+        conn.rollback()
+        raise HTTPException(status_code=400, detail="Username already exists")
+
+@app.post("/login")
+def login(user: UserIn):
+    cur.execute("SELECT id, username FROM users WHERE username=%s AND password=%s", (user.username, user.password))
+    res = cur.fetchone()
+    if not res:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    return {"status": "ok", "user_id": res[0], "username": res[1]}
+
+# ==========================
+# Upload documents
 # ==========================
 @app.post("/upload")
-async def upload(file: UploadFile = File(...), metadata: str = ""):
+async def upload(file: UploadFile = File(...), username: str = ""):
+    user = get_user(username)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid user")
+
     filename = file.filename
-    ext = filename.split(".")[-1].lower()
+    ext = filename.split('.')[-1].lower()
     temp_path = os.path.join(UPLOAD_DIR, f"{uuid.uuid4().hex}_{filename}")
     with open(temp_path, "wb") as f:
         shutil.copyfileobj(file.file, f)
 
-    # Extract text
     if ext in ("pdf",):
         text = extract_text_from_pdf(temp_path)
     elif ext in ("docx", "doc"):
@@ -62,122 +141,91 @@ async def upload(file: UploadFile = File(...), metadata: str = ""):
     elif ext in ("txt",):
         text = extract_text_from_txt(temp_path)
     else:
-        raise HTTPException(status_code=400, detail="Unsupported file type. Use pdf/docx/txt.")
+        raise HTTPException(status_code=400, detail="Unsupported file type.")
 
-    # Chunk text with overlap
-    chunks = chunk_text(text, max_chars=500, overlap=100)
+    chunks = chunk_text(text, max_chars=800)
     if not chunks:
-        raise HTTPException(status_code=400, detail="No text could be extracted from the document.")
+        raise HTTPException(status_code=400, detail="No text could be extracted.")
 
-    # Create embeddings and store in Chroma
     collection = create_or_get_collection(COLLECTION_NAME)
     embs = embed_texts(chunks)
     ids = [f"{uuid.uuid4().hex}" for _ in chunks]
-    metadatas = [
-        {"source_filename": filename, "ord": i, "text_snippet": chunk[:200]}
-        for i, chunk in enumerate(chunks)
-    ]
+    metadatas = [{"source_filename": filename, "ord": i, "text_snippet": chunk[:200]} for i, chunk in enumerate(chunks)]
     collection.add(documents=chunks, embeddings=embs, ids=ids, metadatas=metadatas)
 
     return {"status": "ok", "filename": filename, "num_chunks": len(chunks)}
 
-# ==========================
-# Query endpoint with Gemini
-# ==========================
-class QueryIn(BaseModel):
-    query: str
-    top_k: int = 4
 
 
+
+# ==========================
+# Chat / query
+# ==========================
 @app.post("/query")
 def query_endpoint(q: QueryIn):
-    collection = create_or_get_collection(COLLECTION_NAME)
+    user = get_user(q.username)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid user")
 
-    # embed query
+    collection = create_or_get_collection(COLLECTION_NAME)
     q_emb = embed_texts([q.query])[0]
 
-    # retrieve more chunks than needed
-    n_results = max(q.top_k * 3, q.top_k + 5)
     results = collection.query(
         query_embeddings=[q_emb],
-        n_results=n_results,
-        include=["documents", "metadatas", "distances"],
+        n_results=q.top_k,
+        include=["documents", "metadatas"]
     )
 
-    docs = results["documents"][0]
-    metas = results["metadatas"][0]
-    dists = results["distances"][0]
+    retrieved_chunks = results["documents"][0]
+    retrieved_metadata = results["metadatas"][0]
 
-    # assemble hits
-    hits = [
-        {"document": d, "metadata": m, "distance": dist}
-        for d, m, dist in zip(docs, metas, dists)
-    ]
-    hits.sort(key=lambda x: x["distance"])  # best first
-
-    # dedupe by (filename, ord)
-    seen = set()
-    deduped = []
-    for h in hits:
-        key = (h["metadata"].get("source_filename"), h["metadata"].get("ord"))
-        if key not in seen:
-            seen.add(key)
-            deduped.append(h)
-        if len(deduped) >= q.top_k:
-            break
-
-    # merge consecutive chunks from same file
-    merged = []
-    i = 0
-    while i < len(deduped):
-        cur = deduped[i]
-        cur_meta = cur["metadata"]
-        cur_text = cur["document"]
-        cur_ord = cur_meta.get("ord", 0)
-        src = cur_meta.get("source_filename")
-        j = i + 1
-        while j < len(deduped):
-            nm = deduped[j]["metadata"]
-            if nm.get("source_filename") == src and nm.get("ord") == cur_ord + (j - i):
-                cur_text += "\n\n" + deduped[j]["document"]
-                j += 1
-            else:
-                break
-        merged.append({"source": src, "ord": cur_ord, "text": cur_text})
-        i = j
-
-    # Build context for Gemini
     context_text = "\n\n".join(
-        [f"From {m['source']} (part {m['ord']}):\n{m['text']}" for m in merged]
+        [f"From {meta['source_filename']} (part {meta['ord']}): {doc}" 
+         for doc, meta in zip(retrieved_chunks, retrieved_metadata)]
     )
 
     prompt = f"""
-You are a precise assistant. The user question is:
-"{q.query}"
+    You are an AI assistant. Use the following context to answer the question.
+    If the answer is not in the context, say you don’t know.
 
-Below is the retrieved context from documents. Carefully read the context and **extract ALL distinct items** that answer the question (for example: values, types, names, etc.). 
+    Query: {q.query}
 
-Instructions:
-- Return an enumerated list (1., 2., 3., ...) with each item on its own line.
-- After each item include in parentheses the source filename and part number, e.g. (file.pdf part 3).
-- If you are certain the context does not contain additional items, write a final line: "No other items found in the provided context."
-- If uncertain, say "I could not find more items with high confidence."
+    Context:
+    {context_text}
 
-Context:
-{context_text}
+    Provide a clear, concise, and well-formatted answer.
+    """
 
-Answer:
-"""
-
-    # Call Gemini
-    response = gemini_model.generate_content(
-        prompt,
-        generation_config={"max_output_tokens": 512, "temperature": 0.0}
-    )
+    response = gemini_model.generate_content(prompt)
     answer_text = response.text if hasattr(response, "text") else str(response)
+
+    # Save chat history
+    cur.execute("INSERT INTO chats (user_id, question, answer) VALUES (%s,%s,%s)", (user[0], q.query, answer_text))
+    conn.commit()
 
     return {
         "query": q.query,
         "answer": answer_text,
-        "sources": deduped,  # include distances for debugging
+        "sources": retrieved_metadata
     }
+# ==========================
+# Get chat history
+# ==========================
+@app.get("/history")
+def get_history(username: str):
+    user = get_user(username)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid user")
+    
+    # Use RealDictCursor to get dict rows (optional but cleaner)
+    import psycopg2.extras
+    cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+    cur.execute(
+        "SELECT question, answer, created_at FROM chats WHERE user_id=%s ORDER BY created_at DESC",
+        (user[0],)
+    )
+    rows = cur.fetchall()  # each row is now a dict with keys: question, answer, created_at
+
+    return {"history": rows}
+
